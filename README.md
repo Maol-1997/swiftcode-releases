@@ -1,11 +1,5 @@
 # SwiftCode downloads
 
-## SwiftCode for Mac (native)
-
-**[Download the latest SwiftCode for Mac](https://github.com/Maol-1997/swiftcode-releases/releases/latest)**
-
-The macOS installer is for Apple Silicon Macs. Download the DMG, open it, and drag SwiftCode into Applications.
-
 After the first installation, SwiftCode checks for updates every ten minutes while open. Use **SwiftCode → Check for Updates…**, or the download button that appears in the sidebar when an update is available.
 
 ## SwiftCode Desktop (Mac, Windows, Linux)
@@ -24,3 +18,10 @@ SwiftCode Desktop updates itself on macOS, Windows, and the AppImage; install a 
 ## About these downloads
 
 Mac installers are signed with Developer ID and notarized by Apple. SwiftCode drives the coding agent CLIs you already use (Claude Code, Codex, Cursor, Grok, OpenCode); install and sign in to at least one. This repository contains downloads and automatic update feeds; source development is maintained separately.
+
+
+~~## SwiftCode for Mac (native) DEPRECATED~~
+
+~~**[Download the latest SwiftCode for Mac](https://github.com/Maol-1997/swiftcode-releases/releases/latest)**~~
+
+~~The macOS installer is for Apple Silicon Macs. Download the DMG, open it, and drag SwiftCode into Applications.~~
