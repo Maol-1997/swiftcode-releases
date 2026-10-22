@@ -1,0 +1,252 @@
+name: Desktop Build
+run-name: Desktop build v${{ inputs.version }}
+
+# Builds unsigned Windows and Linux installers for the SwiftCode Desktop release script
+# (apps/desktop/release.sh in the private source repository), which dispatches this
+# workflow after tagging. It lives in this public repository because hosted runners
+# are free here. The private source is checked out with a read-only deploy key, and
+# builds run without --verbose because these logs are public. Installers are staged
+# in a draft release, which only collaborators can see, never as Actions artifacts.
+
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: Desktop version to build, X.Y.Z or X.Y.Z-prerelease
+        required: true
+        type: string
+      source_ref:
+        description: Source ref to build (defaults to the desktop-v<version> tag)
+        required: false
+        type: string
+
+permissions:
+  contents: read
+
+concurrency:
+  group: desktop-build-${{ inputs.version }}
+  cancel-in-progress: false
+
+jobs:
+  preflight:
+    name: Preflight
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    permissions:
+      contents: write
+    outputs:
+      source_ref: ${{ steps.build_meta.outputs.source_ref }}
+      staging_tag: ${{ steps.build_meta.outputs.staging_tag }}
+    steps:
+      - id: build_meta
+        name: Resolve build inputs
+        shell: bash
+        env:
+          SOURCE_REPOSITORY: ${{ vars.DESKTOP_SOURCE_REPOSITORY }}
+          BUILD_VERSION: ${{ inputs.version }}
+          SOURCE_REF: ${{ inputs.source_ref }}
+        run: |
+          set -euo pipefail
+          if [[ -z "$SOURCE_REPOSITORY" ]]; then
+            echo "Set the DESKTOP_SOURCE_REPOSITORY variable to the private source repository." >&2
+            exit 1
+          fi
+          if [[ ! "$BUILD_VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z]+([.-][0-9A-Za-z]+)*)?$ ]]; then
+            echo "Invalid desktop version: $BUILD_VERSION" >&2
+            exit 1
+          fi
+          echo "source_ref=${SOURCE_REF:-desktop-v$BUILD_VERSION}" >> "$GITHUB_OUTPUT"
+          echo "staging_tag=desktop-build-v$BUILD_VERSION" >> "$GITHUB_OUTPUT"
+
+      # Created once here so the parallel builds never race to create it. A draft
+      # is visible only to collaborators and never creates its tag.
+      - name: Create staging draft release
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          STAGING_TAG: ${{ steps.build_meta.outputs.staging_tag }}
+          BUILD_VERSION: ${{ inputs.version }}
+        run: |
+          set -euo pipefail
+          if ! gh release view "$STAGING_TAG" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            gh release create "$STAGING_TAG" --repo "$GITHUB_REPOSITORY" --draft \
+              --title "CI builds for SwiftCode Desktop v$BUILD_VERSION" \
+              --notes "Staging for the local release script, which deletes this draft after downloading it."
+          fi
+
+  build:
+    name: Build ${{ matrix.label }}
+    needs: preflight
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 30
+    permissions:
+      contents: write
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - label: Linux x64
+            runner: ubuntu-24.04
+            platform: linux
+            target: AppImage
+            arch: x64
+            rust_target: x86_64-unknown-linux-gnu
+          - label: Windows x64
+            runner: windows-2025
+            platform: win
+            target: nsis
+            arch: x64
+            rust_target: x86_64-pc-windows-msvc
+            # 7-Zip's fast LZMA2 mode compresses the installer payload several times
+            # faster for a ~9% larger installer (128 -> 140 MiB).
+            compression_level: "3"
+    steps:
+      - name: Checkout source
+        uses: actions/checkout@v6
+        # Use every core without changing the runner's persistent Git configuration.
+        env:
+          GIT_CONFIG_COUNT: "1"
+          GIT_CONFIG_KEY_0: checkout.workers
+          GIT_CONFIG_VALUE_0: "0"
+        with:
+          repository: ${{ vars.DESKTOP_SOURCE_REPOSITORY }}
+          ref: ${{ needs.preflight.outputs.source_ref }}
+          ssh-key: ${{ secrets.DESKTOP_SOURCE_DEPLOY_KEY }}
+          persist-credentials: false
+          sparse-checkout: |
+            /*
+            !/.repos/
+          sparse-checkout-cone-mode: false
+
+      - name: Setup Vite+
+        id: setup_vp
+        uses: voidzero-dev/setup-vp@v1.21.1
+        with:
+          node-version-file: package.json
+          cache: false
+          run-install: false
+
+      - name: Resolve dependency cache
+        if: runner.os == 'Linux'
+        id: dependency_cache
+        shell: bash
+        env:
+          CACHE_INPUTS: ${{ hashFiles('pnpm-lock.yaml', 'pnpm-workspace.yaml', 'package.json', 'patches/*.patch') }}
+        run: |
+          set -euo pipefail
+          printf 'path=%s\n' "$(vp pm cache dir)" >> "$GITHUB_OUTPUT"
+          printf 'key=desktop-deps-v2-%s-%s-node%s-pnpm%s-vp%s-%s\n' \
+            "$RUNNER_OS" "$RUNNER_ARCH" "$(node --version)" "$(pnpm --version)" \
+            "${{ steps.setup_vp.outputs.version }}" "$CACHE_INPUTS" >> "$GITHUB_OUTPUT"
+
+      # Every dispatch runs on this repository's default branch, so a miss saves a
+      # cache the next build restores. No restore-keys: an older store can conflict
+      # with updated dependency patches. Windows installs directly because restoring
+      # its package store costs more than downloading it.
+      - name: Cache dependencies
+        if: runner.os == 'Linux'
+        uses: actions/cache@v5
+        with:
+          path: ${{ steps.dependency_cache.outputs.path }}
+          key: ${{ steps.dependency_cache.outputs.key }}
+
+      - name: Setup Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.rust_target }}
+
+      - name: Cache Rust build
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: native/resource-monitor -> target
+          shared-key: desktop-${{ matrix.rust_target }}
+
+      # The resource monitor compiles while the network-bound install runs; the
+      # identical cargo build in dist:desktop:artifact then finds it up to date.
+      - name: Install desktop dependencies
+        shell: bash
+        env:
+          RUST_TARGET: ${{ matrix.rust_target }}
+        run: |
+          set -euo pipefail
+          cargo build --locked --release --manifest-path native/resource-monitor/Cargo.toml \
+            --target "$RUST_TARGET" &
+          cargo_pid=$!
+          vp install --frozen-lockfile \
+            --filter=@t3tools/desktop... \
+            --filter=@t3tools/web... \
+            --filter=t3... \
+            --filter=@t3tools/scripts...
+          wait "$cargo_pid"
+
+      - name: Install ImageMagick
+        if: matrix.platform == 'linux'
+        shell: bash
+        run: |
+          if ! command -v magick >/dev/null 2>&1 && ! command -v convert >/dev/null 2>&1; then
+              sudo apt-get update
+              sudo apt-get install -y imagemagick
+          fi
+
+          if command -v magick >/dev/null 2>&1; then
+              magick -version
+          else
+              convert -version
+          fi
+
+      - name: Build desktop artifact
+        shell: bash
+        env:
+          T3CODE_DESKTOP_UPDATE_REPOSITORY: ${{ github.repository }}
+          # Unset (empty) on Linux: the build script drops empty variables.
+          ELECTRON_BUILDER_COMPRESSION_LEVEL: ${{ matrix.compression_level }}
+          BUILD_PLATFORM: ${{ matrix.platform }}
+          BUILD_TARGET: ${{ matrix.target }}
+          BUILD_ARCH: ${{ matrix.arch }}
+          BUILD_VERSION: ${{ inputs.version }}
+        run: |
+          set -euo pipefail
+          # The app is staged under TEMP, which defaults to C: while the checkout and
+          # pnpm store live on D:. Staging on D: lets the staged install hard-link
+          # from the store instead of downloading every package again.
+          if [[ "$RUNNER_OS" == Windows ]]; then
+            export TEMP="$RUNNER_TEMP" TMP="$RUNNER_TEMP"
+          fi
+          vp run dist:desktop:artifact \
+            --platform "$BUILD_PLATFORM" --target "$BUILD_TARGET" --arch "$BUILD_ARCH" \
+            --build-version "$BUILD_VERSION"
+
+      - name: Collect release assets
+        shell: bash
+        env:
+          BUILD_PLATFORM: ${{ matrix.platform }}
+          BUILD_VERSION: ${{ inputs.version }}
+        run: |
+          set -euo pipefail
+          mkdir -p release-publish
+          shopt -s nullglob
+          for pattern in "release/*.AppImage" "release/*.deb" "release/*.exe" "release/*.blockmap"; do
+            for file in $pattern; do
+              cp "$file" release-publish/
+            done
+          done
+          # Prerelease channels are archived under the same platform manifest names,
+          # but the local publisher never advances the stable feed for them.
+          channel=latest
+          if [[ "$BUILD_VERSION" == *-* ]]; then
+            channel="${BUILD_VERSION#*-}"
+            channel="${channel%%.*}"
+          fi
+          suffix=""
+          if [[ "$BUILD_PLATFORM" == linux ]]; then suffix=-linux; fi
+          cp "release/${channel}${suffix}.yml" "release-publish/latest${suffix}.yml"
+
+      - name: Stage build in the draft release
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          STAGING_TAG: ${{ needs.preflight.outputs.staging_tag }}
+        run: |
+          set -euo pipefail
+          # --clobber lets a rerun replace its own platform's files.
+          gh release upload "$STAGING_TAG" release-publish/* --repo "$GITHUB_REPOSITORY" --clobber
