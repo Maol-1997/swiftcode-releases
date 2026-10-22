@@ -101,6 +101,10 @@ jobs:
             # faster for a ~9% larger installer (128 -> 140 MiB).
             compression_level: "3"
     steps:
+      # The read-only deploy key stays configured until the job's post step removes
+      # it: persist-credentials: false would remove it right after checkout, but that
+      # cleanup runs `git submodule foreach`, which fails on a vendored gitlink under
+      # .repos/ that has no .gitmodules entry.
       - name: Checkout source
         uses: actions/checkout@v6
         # Use every core without changing the runner's persistent Git configuration.
@@ -112,7 +116,6 @@ jobs:
           repository: ${{ vars.DESKTOP_SOURCE_REPOSITORY }}
           ref: ${{ needs.preflight.outputs.source_ref }}
           ssh-key: ${{ secrets.DESKTOP_SOURCE_DEPLOY_KEY }}
-          persist-credentials: false
           sparse-checkout: |
             /*
             !/.repos/
