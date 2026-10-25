@@ -1,22 +1,26 @@
 name: Desktop Build
-run-name: Desktop build v${{ inputs.version }}
+# apps/desktop/release.sh in the private source repository reads the source SHA and any
+# explicit version back from this name.
+run-name: Desktop build ${{ inputs.source_sha }}${{ inputs.version && format(' v{0}', inputs.version) || '' }}
 
-# Builds unsigned Windows and Linux installers for the SwiftCode Desktop release script
-# (apps/desktop/release.sh in the private source repository), which dispatches this
-# workflow after tagging. It lives in this public repository because hosted runners
-# are free here. The private source is checked out with a read-only deploy key, and
-# builds run without --verbose because these logs are public. Installers are staged
-# in a draft release, which only collaborators can see, never as Actions artifacts.
+# Builds a ready-to-publish SwiftCode Desktop release of one source commit: a signed and
+# notarized Apple silicon DMG plus unsigned Windows and Linux installers. The private
+# source repository dispatches this on every push to its default branch, and its
+# apps/desktop/release.sh approves a finished or running build for the Desktop Publish
+# workflow. It lives in this public repository because hosted runners are free here. The
+# private source is checked out with a read-only deploy key, and builds run without
+# --verbose because these logs are public. Installers are staged in a draft release,
+# which only collaborators can see, never as Actions artifacts.
 
 on:
   workflow_dispatch:
     inputs:
-      version:
-        description: Desktop version to build, X.Y.Z or X.Y.Z-prerelease
+      source_sha:
+        description: Source commit SHA to build
         required: true
         type: string
-      source_ref:
-        description: Source ref to build (defaults to the desktop-v<version> tag)
+      version:
+        description: Desktop version, X.Y.Z or X.Y.Z-prerelease (defaults to the next patch)
         required: false
         type: string
 
@@ -24,7 +28,7 @@ permissions:
   contents: read
 
 concurrency:
-  group: desktop-build-${{ inputs.version }}
+  group: desktop-build-${{ inputs.source_sha }}
   cancel-in-progress: false
 
 jobs:
@@ -35,44 +39,58 @@ jobs:
     permissions:
       contents: write
     outputs:
-      source_ref: ${{ steps.build_meta.outputs.source_ref }}
+      source_sha: ${{ steps.build_meta.outputs.source_sha }}
+      version: ${{ steps.build_meta.outputs.version }}
       staging_tag: ${{ steps.build_meta.outputs.staging_tag }}
     steps:
+      # Full commit history and tags without file contents, for the release notes.
+      - name: Checkout source history
+        uses: actions/checkout@v6
+        with:
+          repository: ${{ vars.DESKTOP_SOURCE_REPOSITORY }}
+          ref: ${{ inputs.source_sha }}
+          ssh-key: ${{ secrets.DESKTOP_SOURCE_DEPLOY_KEY }}
+          fetch-depth: 0
+          filter: blob:none
+          sparse-checkout: /apps/desktop/scripts/
+          sparse-checkout-cone-mode: false
+
       - id: build_meta
         name: Resolve build inputs
         shell: bash
         env:
-          SOURCE_REPOSITORY: ${{ vars.DESKTOP_SOURCE_REPOSITORY }}
-          BUILD_VERSION: ${{ inputs.version }}
-          SOURCE_REF: ${{ inputs.source_ref }}
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_REPOSITORY: ${{ github.repository }}
+          REQUESTED_VERSION: ${{ inputs.version }}
         run: |
           set -euo pipefail
-          if [[ -z "$SOURCE_REPOSITORY" ]]; then
-            echo "Set the DESKTOP_SOURCE_REPOSITORY variable to the private source repository." >&2
+          source_sha="$(git rev-parse HEAD)"
+          version="${REQUESTED_VERSION#v}"
+          if [[ -z "$version" ]]; then
+            version="$(apps/desktop/scripts/next-release-version.sh)"
+          fi
+          if [[ ! "$version" =~ ^[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z]+([.-][0-9A-Za-z]+)*)?$ ]]; then
+            echo "Invalid desktop version: $version" >&2
             exit 1
           fi
-          if [[ ! "$BUILD_VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z]+([.-][0-9A-Za-z]+)*)?$ ]]; then
-            echo "Invalid desktop version: $BUILD_VERSION" >&2
-            exit 1
-          fi
-          echo "source_ref=${SOURCE_REF:-desktop-v$BUILD_VERSION}" >> "$GITHUB_OUTPUT"
-          echo "staging_tag=desktop-build-v$BUILD_VERSION" >> "$GITHUB_OUTPUT"
+          apps/desktop/scripts/release-notes.sh "$source_sha" "$version" > "$RUNNER_TEMP/release-notes.md"
+          echo "source_sha=$source_sha" >> "$GITHUB_OUTPUT"
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+          echo "staging_tag=desktop-build-$GITHUB_RUN_ID" >> "$GITHUB_OUTPUT"
 
-      # Created once here so the parallel builds never race to create it. A draft
-      # is visible only to collaborators and never creates its tag.
+      # Created once here so the parallel builds never race to create it. A draft is
+      # visible only to collaborators and never creates its tag; publishing renames it
+      # to desktop-v<version>.
       - name: Create staging draft release
         shell: bash
         env:
           GH_TOKEN: ${{ github.token }}
           STAGING_TAG: ${{ steps.build_meta.outputs.staging_tag }}
-          BUILD_VERSION: ${{ inputs.version }}
+          BUILD_VERSION: ${{ steps.build_meta.outputs.version }}
         run: |
           set -euo pipefail
-          if ! gh release view "$STAGING_TAG" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
-            gh release create "$STAGING_TAG" --repo "$GITHUB_REPOSITORY" --draft \
-              --title "CI builds for SwiftCode Desktop v$BUILD_VERSION" \
-              --notes "Staging for the local release script, which deletes this draft after downloading it."
-          fi
+          gh release create "$STAGING_TAG" --repo "$GITHUB_REPOSITORY" --draft \
+            --title "SwiftCode Desktop v$BUILD_VERSION" --notes-file "$RUNNER_TEMP/release-notes.md"
 
   build:
     name: Build ${{ matrix.label }}
@@ -85,6 +103,12 @@ jobs:
       fail-fast: false
       matrix:
         include:
+          - label: macOS arm64
+            runner: macos-15
+            platform: mac
+            target: dmg
+            arch: arm64
+            rust_target: aarch64-apple-darwin
           - label: Linux x64
             runner: ubuntu-24.04
             platform: linux
@@ -114,7 +138,7 @@ jobs:
           GIT_CONFIG_VALUE_0: "0"
         with:
           repository: ${{ vars.DESKTOP_SOURCE_REPOSITORY }}
-          ref: ${{ needs.preflight.outputs.source_ref }}
+          ref: ${{ needs.preflight.outputs.source_sha }}
           ssh-key: ${{ secrets.DESKTOP_SOURCE_DEPLOY_KEY }}
           sparse-checkout: |
             /*
@@ -197,6 +221,54 @@ jobs:
               convert -version
           fi
 
+      # Secrets enter only this macOS step. Decoded credentials are written straight to
+      # files and never printed: log masking covers the secret values, not their decodings.
+      - name: Install ephemeral signing credentials
+        if: matrix.platform == 'mac'
+        shell: bash
+        env:
+          MACOS_CERTIFICATE_P12_BASE64: ${{ secrets.MACOS_CERTIFICATE_P12_BASE64 }}
+          MACOS_CERTIFICATE_PASSWORD: ${{ secrets.MACOS_CERTIFICATE_PASSWORD }}
+          MACOS_SIGNING_IDENTITY: ${{ vars.MACOS_SIGNING_IDENTITY }}
+          NOTARY_KEY_P8_BASE64: ${{ secrets.APPLE_NOTARY_KEY_P8_BASE64 }}
+          NOTARY_KEY_ID: ${{ secrets.APPLE_NOTARY_KEY_ID }}
+          NOTARY_ISSUER_ID: ${{ secrets.APPLE_NOTARY_ISSUER_ID }}
+        run: |
+          set -euo pipefail
+          for name in MACOS_CERTIFICATE_P12_BASE64 MACOS_CERTIFICATE_PASSWORD MACOS_SIGNING_IDENTITY \
+            NOTARY_KEY_P8_BASE64 NOTARY_KEY_ID NOTARY_ISSUER_ID; do
+            if [[ -z "${!name}" ]]; then
+              echo "Set the $name signing configuration on this repository." >&2
+              exit 1
+            fi
+          done
+          credentials_root="$RUNNER_TEMP/signing"
+          mkdir -m 700 "$credentials_root"
+          certificate_path="$credentials_root/developer-id.p12"
+          notary_key_path="$credentials_root/notary-key.p8"
+          printf '%s' "$MACOS_CERTIFICATE_P12_BASE64" | base64 --decode > "$certificate_path"
+          printf '%s' "$NOTARY_KEY_P8_BASE64" | base64 --decode > "$notary_key_path"
+          keychain_path="$credentials_root/signing.keychain-db"
+          keychain_password="$(uuidgen)"
+          security create-keychain -p "$keychain_password" "$keychain_path"
+          security set-keychain-settings -lut 21600 "$keychain_path"
+          security unlock-keychain -p "$keychain_password" "$keychain_path"
+          security import "$certificate_path" -k "$keychain_path" -P "$MACOS_CERTIFICATE_PASSWORD" \
+            -T /usr/bin/codesign -T /usr/bin/security
+          rm -f "$certificate_path"
+          security set-key-partition-list -S apple-tool:,apple:,codesign: -s -k "$keychain_password" \
+            "$keychain_path" > /dev/null
+          security list-keychains -d user -s "$keychain_path"
+          security find-certificate -c "$MACOS_SIGNING_IDENTITY" "$keychain_path" > /dev/null
+          # electron-builder finds the identity in the keychain search list and notarizes the
+          # app with the App Store Connect API key; finish-mac-artifacts.sh reuses the key.
+          {
+            echo "CSC_NAME=${MACOS_SIGNING_IDENTITY#Developer ID Application: }"
+            echo "APPLE_API_KEY=$notary_key_path"
+            echo "APPLE_API_KEY_ID=$NOTARY_KEY_ID"
+            echo "APPLE_API_ISSUER=$NOTARY_ISSUER_ID"
+          } >> "$GITHUB_ENV"
+
       - name: Build desktop artifact
         shell: bash
         env:
@@ -206,7 +278,7 @@ jobs:
           BUILD_PLATFORM: ${{ matrix.platform }}
           BUILD_TARGET: ${{ matrix.target }}
           BUILD_ARCH: ${{ matrix.arch }}
-          BUILD_VERSION: ${{ inputs.version }}
+          BUILD_VERSION: ${{ needs.preflight.outputs.version }}
         run: |
           set -euo pipefail
           # The app is staged under TEMP, which defaults to C: while the checkout and
@@ -215,33 +287,51 @@ jobs:
           if [[ "$RUNNER_OS" == Windows ]]; then
             export TEMP="$RUNNER_TEMP" TMP="$RUNNER_TEMP"
           fi
+          # Only the Mac build is signed; Windows has no signing credentials yet.
+          signed=()
+          if [[ "$BUILD_PLATFORM" == mac ]]; then signed=(--signed); fi
           vp run dist:desktop:artifact \
             --platform "$BUILD_PLATFORM" --target "$BUILD_TARGET" --arch "$BUILD_ARCH" \
-            --build-version "$BUILD_VERSION"
+            --build-version "$BUILD_VERSION" "${signed[@]}"
+
+      - name: Sign and notarize the DMG
+        if: matrix.platform == 'mac'
+        shell: bash
+        env:
+          RELEASE_REPOSITORY: ${{ github.repository }}
+          MACOS_SIGNING_IDENTITY: ${{ vars.MACOS_SIGNING_IDENTITY }}
+        run: |
+          set -euo pipefail
+          NOTARY_KEY_PATH="$APPLE_API_KEY" NOTARY_KEY_ID="$APPLE_API_KEY_ID" \
+            NOTARY_ISSUER_ID="$APPLE_API_ISSUER" apps/desktop/scripts/finish-mac-artifacts.sh release
 
       - name: Collect release assets
         shell: bash
         env:
           BUILD_PLATFORM: ${{ matrix.platform }}
-          BUILD_VERSION: ${{ inputs.version }}
+          BUILD_VERSION: ${{ needs.preflight.outputs.version }}
         run: |
           set -euo pipefail
           mkdir -p release-publish
           shopt -s nullglob
-          for pattern in "release/*.AppImage" "release/*.deb" "release/*.exe" "release/*.blockmap"; do
+          for pattern in "release/*.dmg" "release/*.zip" "release/*.AppImage" "release/*.deb" \
+            "release/*.exe" "release/*.blockmap"; do
             for file in $pattern; do
               cp "$file" release-publish/
             done
           done
           # Prerelease channels are archived under the same platform manifest names,
-          # but the local publisher never advances the stable feed for them.
+          # but the publisher never advances the stable feed for them.
           channel=latest
           if [[ "$BUILD_VERSION" == *-* ]]; then
             channel="${BUILD_VERSION#*-}"
             channel="${channel%%.*}"
           fi
-          suffix=""
-          if [[ "$BUILD_PLATFORM" == linux ]]; then suffix=-linux; fi
+          case "$BUILD_PLATFORM" in
+            mac) suffix=-mac ;;
+            linux) suffix=-linux ;;
+            *) suffix="" ;;
+          esac
           cp "release/${channel}${suffix}.yml" "release-publish/latest${suffix}.yml"
 
       - name: Stage build in the draft release
@@ -253,3 +343,55 @@ jobs:
           set -euo pipefail
           # --clobber lets a rerun replace its own platform's files.
           gh release upload "$STAGING_TAG" release-publish/* --repo "$GITHUB_REPOSITORY" --clobber
+
+  finalize:
+    name: Finalize draft
+    needs: [preflight, build]
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    permissions:
+      contents: write
+      actions: write
+    steps:
+      - name: Checkout release scripts
+        uses: actions/checkout@v6
+        with:
+          repository: ${{ vars.DESKTOP_SOURCE_REPOSITORY }}
+          ref: ${{ needs.preflight.outputs.source_sha }}
+          ssh-key: ${{ secrets.DESKTOP_SOURCE_DEPLOY_KEY }}
+          sparse-checkout: /apps/desktop/scripts/
+          sparse-checkout-cone-mode: false
+
+      - name: Retire stale drafts
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_REPOSITORY: ${{ github.repository }}
+          REQUESTED_VERSION: ${{ inputs.version }}
+          BUILD_VERSION: ${{ needs.preflight.outputs.version }}
+          SOURCE_SHA: ${{ needs.preflight.outputs.source_sha }}
+          STAGING_TAG: ${{ needs.preflight.outputs.staging_tag }}
+        run: |
+          set -euo pipefail
+          # A publication that finished while this ran claimed its version: rebuild as the next one.
+          if [[ -z "$REQUESTED_VERSION" && "$BUILD_VERSION" != "$(apps/desktop/scripts/next-release-version.sh)" ]]; then
+            gh release delete "$STAGING_TAG" --repo "$GITHUB_REPOSITORY" --yes
+            gh workflow run desktop-build.yml --repo "$GITHUB_REPOSITORY" -f source_sha="$SOURCE_SHA"
+            echo "v$BUILD_VERSION was published meanwhile; dispatched a rebuild of $SOURCE_SHA."
+            exit 0
+          fi
+          # Only the newest build is ever approved, so finished older drafts are garbage,
+          # unless a publication is still waiting on one.
+          active="$(gh run list --workflow desktop-publish.yml --repo "$GITHUB_REPOSITORY" --json status \
+            --jq '[.[] | select(.status != "completed")] | length')"
+          if [[ "$active" != 0 ]]; then exit 0; fi
+          drafts="$(gh api --paginate "repos/$GITHUB_REPOSITORY/releases" \
+            --jq '.[] | select(.draft) | .tag_name' | sed -n 's/^desktop-build-\([0-9][0-9]*\)$/\1/p')"
+          for run_id in $drafts; do
+            # A deleted run reads as completed.
+            if (( run_id < GITHUB_RUN_ID )) &&
+              [[ "$(gh run view "$run_id" --repo "$GITHUB_REPOSITORY" --json status --jq .status 2>/dev/null ||
+                echo completed)" == completed ]]; then
+              gh release delete "desktop-build-$run_id" --repo "$GITHUB_REPOSITORY" --yes
+            fi
+          done

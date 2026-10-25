@@ -1,0 +1,78 @@
+name: Desktop Publish
+run-name: Publish desktop v${{ inputs.version }} from build ${{ inputs.run_id }}
+
+# apps/desktop/release.sh in the private source repository dispatches this to approve one
+# Desktop Build run, finished or still running. It waits for that run, then publishes its
+# draft as desktop-v<version> and, for stable versions, advances the desktop-stable feed.
+
+on:
+  workflow_dispatch:
+    inputs:
+      run_id:
+        description: Desktop Build run whose draft to publish
+        required: true
+        type: string
+      version:
+        description: Desktop version the build carries
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+concurrency:
+  group: desktop-publish
+  cancel-in-progress: false
+
+jobs:
+  publish:
+    name: Publish
+    runs-on: ubuntu-24.04
+    timeout-minutes: 90
+    permissions:
+      contents: write
+      actions: read
+    steps:
+      - name: Wait for the approved build
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RUN_ID: ${{ inputs.run_id }}
+        run: |
+          set -euo pipefail
+          gh run watch "$RUN_ID" --repo "$GITHUB_REPOSITORY" --exit-status --compact --interval 30
+          gh release view "desktop-build-$RUN_ID" --repo "$GITHUB_REPOSITORY" > /dev/null 2>&1 || {
+            echo "Build $RUN_ID has no draft; a newer build replaced it. Approve that one instead." >&2
+            exit 1
+          }
+
+      # See desktop-build.yml for why the deploy key stays configured until the job ends.
+      - name: Checkout source
+        uses: actions/checkout@v6
+        with:
+          repository: ${{ vars.DESKTOP_SOURCE_REPOSITORY }}
+          ssh-key: ${{ secrets.DESKTOP_SOURCE_DEPLOY_KEY }}
+          sparse-checkout: |
+            /*
+            !/.repos/
+          sparse-checkout-cone-mode: false
+
+      - name: Setup Vite+
+        uses: voidzero-dev/setup-vp@v1.21.1
+        with:
+          node-version-file: package.json
+          cache: false
+          run-install: false
+
+      - name: Install release script dependencies
+        shell: bash
+        run: vp install --frozen-lockfile --filter=@t3tools/scripts...
+
+      - name: Publish the draft
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_REPOSITORY: ${{ github.repository }}
+          VERSION: ${{ inputs.version }}
+          RUN_ID: ${{ inputs.run_id }}
+        run: apps/desktop/scripts/publish-release.sh "$VERSION" "desktop-build-$RUN_ID"
