@@ -215,21 +215,6 @@ jobs:
             --filter=@t3tools/scripts...
           wait "$cargo_pid"
 
-      - name: Install ImageMagick
-        if: matrix.platform == 'linux'
-        shell: bash
-        run: |
-          if ! command -v magick >/dev/null 2>&1 && ! command -v convert >/dev/null 2>&1; then
-              sudo apt-get update
-              sudo apt-get install -y imagemagick
-          fi
-
-          if command -v magick >/dev/null 2>&1; then
-              magick -version
-          else
-              convert -version
-          fi
-
       # Secrets enter only this macOS step. Decoded credentials are written straight to
       # files and never printed: log masking covers the secret values, not their decodings.
       - name: Install ephemeral signing credentials
