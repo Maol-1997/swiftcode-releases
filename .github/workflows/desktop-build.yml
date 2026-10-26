@@ -154,7 +154,7 @@ jobs:
           run-install: false
 
       - name: Resolve dependency cache
-        if: runner.os == 'Linux'
+        if: runner.os != 'Windows'
         id: dependency_cache
         shell: bash
         env:
@@ -171,11 +171,20 @@ jobs:
       # with updated dependency patches. Windows installs directly because restoring
       # its package store costs more than downloading it.
       - name: Cache dependencies
-        if: runner.os == 'Linux'
+        if: runner.os != 'Windows'
         uses: actions/cache@v5
         with:
           path: ${{ steps.dependency_cache.outputs.path }}
           key: ${{ steps.dependency_cache.outputs.key }}
+
+      - name: Cache macOS Electron downloads
+        if: runner.os == 'macOS'
+        uses: actions/cache@v5
+        with:
+          path: |
+            ~/Library/Caches/electron
+            ~/Library/Caches/electron-builder
+          key: desktop-electron-v1-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('pnpm-lock.yaml', 'apps/desktop/package.json') }}
 
       - name: Setup Rust
         uses: dtolnay/rust-toolchain@stable
