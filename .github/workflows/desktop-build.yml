@@ -327,6 +327,12 @@ jobs:
             *) suffix="" ;;
           esac
           cp "release/${channel}${suffix}.yml" "release-publish/latest${suffix}.yml"
+          # The server bundle is platform-neutral JavaScript; Linux hosts installed by the
+          # swiftcode-doc skill update from it, so one build publishes it.
+          if [[ "$BUILD_PLATFORM" == linux ]]; then
+            node .agents/skills/swiftcode-doc/scripts/pack-server.mjs apps/server/dist \
+              "release-publish/swiftcode-server-$BUILD_VERSION.tgz" >/dev/null
+          fi
 
       - name: Stage build in the draft release
         shell: bash
