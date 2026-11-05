@@ -38,10 +38,14 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
           RUN_ID: ${{ inputs.run_id }}
+          VERSION: ${{ inputs.version }}
+        # A published desktop-v<version> means an earlier attempt turned the draft into it; the
+        # publish script then resumes from that release.
         run: |
           set -euo pipefail
           gh run watch "$RUN_ID" --repo "$GITHUB_REPOSITORY" --exit-status --compact --interval 30
-          gh release view "desktop-build-$RUN_ID" --repo "$GITHUB_REPOSITORY" > /dev/null 2>&1 || {
+          gh release view "desktop-build-$RUN_ID" --repo "$GITHUB_REPOSITORY" > /dev/null 2>&1 ||
+            gh release view "desktop-v$VERSION" --repo "$GITHUB_REPOSITORY" > /dev/null 2>&1 || {
             echo "Build $RUN_ID has no draft; a newer build replaced it. Approve that one instead." >&2
             exit 1
           }
